@@ -2,6 +2,9 @@
 /data/
 /results/
 
+*.html
+/analysis/*_files/
+*.RDS
 
 ########## R.gitignore ##########
 
