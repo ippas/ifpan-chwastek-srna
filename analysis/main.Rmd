@@ -1,0 +1,247 @@
+---
+title: "ifpan-chwastek-srna"
+output:
+  html_document:
+    toc: yes
+
+date: "_Ostatnio sporządzony: `r format(Sys.time(), '%d %B, %Y %H:%M:%S')`_"
+
+knit: (function(input, ...) {
+    rmarkdown::render(
+      input,
+      output_file = paste0(
+        xfun::sans_ext(input), '-tmp.html'
+      ),
+      envir = globalenv()
+    )
+  })
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(cache = TRUE, include = FALSE, warning = FALSE)
+```
+
+```{r install_packages, eval=FALSE}
+install.packages('gplots')
+install.packages('rstatix')
+install.packages('kableExtra')
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+# https://github.com/Bioconductor/bioconductor_docker/issues/22
+BiocManager::install("preprocessCore", configure.args="--disable-threading")
+```
+
+```{r}
+library(tidyverse)
+library(preprocessCore)
+library(gplots)
+library(RColorBrewer)
+library(rstatix)
+library(kableExtra)
+```
+
+```{r load_data}
+srna_counts <- 
+  read_tsv('data/feature-counts/srna-counts.txt', comment = '#') %>% 
+  rename(gene_id = Geneid) %>% 
+  select(-c(Chr, Start, End, Strand, Length))
+  
+.group_cols <- str_extract(colnames(srna_counts), '(HF|OA)\\d+')
+.is_sample <- !is.na(.group_cols)
+colnames(srna_counts)[.is_sample] <- .group_cols[.is_sample]
+
+names <- read_tsv(
+  'data/gtf_annotations.tsv',
+  col_types = 'cccc-',
+  col_names = c('gene_id', 'gene_name', 'source', 'description')
+)
+
+sample_info <- 
+  read_tsv(
+    "raw/2021-07-09-lista-próbek-sekwencjonowanie.csv",
+    col_names = c('id', 'patient_id', 'treatment')
+  ) %>% 
+  mutate(group = str_sub(id, end = 2)) %>% 
+  mutate(comment = "ok")
+sample_info[sample_info$id == 'HF011', 'comment'] <- "low quality"
+sample_info[sample_info$id == 'OA222', 'comment'] <- "not performed"
+
+write_tsv(sample_info, 'data/sample_info.tsv')
+```
+
+```{r filter_data}
+.median_in_row <- apply(select(srna_counts, -gene_id), 1, median)
+.small <- c(
+  "miRNA", "snRNA", "snoRNA", "rRNA", "scRNA",
+  "sRNA", "vaultRNA", "Mt_tRNA", "Mt_rRNA"
+)
+srna_counts_filtered <-
+  srna_counts %>% 
+  left_join(names, by = 'gene_id') %>% 
+  relocate(gene_id, gene_name, source, description) %>% 
+  filter(.median_in_row > 0) %>%
+  filter(description %in% .small)
+
+srna <- list('counts' = NULL, 'normlog' = NULL, 'annot' = NULL)
+srna[['counts']] <- 
+  srna_counts_filtered %>% 
+  select(starts_with('HF'), starts_with('OA'))
+
+srna[['annot']] <- 
+  srna_counts_filtered %>% 
+  select(-starts_with('HF'), -starts_with('OA'))
+
+srna[['normlog']] <-
+  srna[['counts']] %>% 
+  data.matrix %>% 
+  normalize.quantiles(copy = FALSE) %>%
+  {log2(. + 1)}
+rownames(srna$normlog) <- srna$annot$gene_id
+
+sample_info <- 
+  read_tsv('data/sample_info.tsv') %>% 
+  filter(comment == "ok") %>%
+  select(id, patient_id, treatment, group)
+```
+
+```{r}
+srna[['anova_template']] <-
+    tibble(id = colnames(srna$counts)) %>%
+    left_join(sample_info, by = 'id') %>%
+    mutate(counts = -1)
+
+compute_anova <- function(x, fpkm_df = srna$anova_template, dismiss_pma = FALSE) {
+    fpkm_df %>%
+    left_join(as_tibble(x, rownames = 'id'), by = 'id') %>%
+    mutate(counts = value, .keep = 'unused') %>%
+    {if (dismiss_pma) filter(., stimulation != 'PMA') else .} %>%
+    anova_test(
+        dv = counts,
+        wid = patient_id,
+        between = group,
+        within = treatment
+    ) %>%
+    get_anova_table() %>%
+    data.frame() %>%
+    select(Effect, p) %>%
+    pivot_wider(names_from = Effect, values_from = p)
+}
+```
+
+```{r anova_4x3, eval=F}
+anova <- apply(
+    srna[['normlog']],
+    1,
+    compute_anova,
+    fpkm_df = srna[['anova_template']]
+)
+anova <- bind_rows(anova)
+anova[['gene_id']] <- rownames(srna[['normlog']])
+
+anova_fdr <- 
+  anova %>% 
+  mutate(across(-gene_id, list(fdr = p.adjust), method = 'fdr')) %>%
+  full_join(srna[['annot']] %>% select(gene_id, gene_name, description), by = 'gene_id') %>%
+  relocate(gene_id, gene_name, description)
+
+saveRDS(anova_fdr, 'analysis/anova_fdr.RDS')
+```
+
+```{r heatmap_preparation}
+anova_fdr <- readRDS('analysis/anova_fdr.RDS')
+
+print_anova_table <- function(anova_filtered) {
+    anova_filtered %>% 
+        kbl(digits = 3, caption = '') %>% 
+        kable_styling(bootstrap_options = c("bordered", "hover", "condensed")) %>% 
+        print
+}
+
+plot_anova_heatmap <- function(anova_filtered, data, row_v = TRUE) {
+    palette <- brewer.pal(11, "RdBu")
+    rdbu_ramp <- colorRampPalette(palette)
+    
+    treatments <- c('Ctrl', 'LPS', 'IFNg')
+    y_join_colors <- tibble(
+        treatment = treatments,
+        col_side = brewer.pal(length(treatments), 'Set1')
+    )
+    sample_info_heatmap <- 
+        sample_info %>% 
+        left_join(y_join_colors, by = 'treatment') %>%
+        mutate(lab_col = paste(id, group, sep = ' · ')) %>% 
+        arrange(treatment, group)
+    
+    genes_oi <- pull(anova_filtered, gene_id)
+    groups_arranged <- pull(sample_info_heatmap, id)
+    
+    col_sep <- sample_info_heatmap %>% 
+        group_by(treatment) %>% 
+        mutate(sep = !duplicated(group)) %>% 
+        pull(sep) %>% 
+        which
+    col_sep <- col_sep[-1] - 1
+    
+    heatmap.2(
+        x = data[genes_oi, groups_arranged],
+        Rowv = row_v,
+        Colv = FALSE,
+        dendrogram = 'row',
+        distfun = function(x) as.dist(1-cor(t(x))),
+        
+        scale = "row",
+        breaks = seq(-3, 3, 0.25),
+        col = rev(rdbu_ramp(24)),
+        
+        colsep = col_sep,
+        sepcolor = 'white',
+        sepwidth = c(0.2, 0.2),
+        trace = "none",
+        
+        ColSideColors = sample_info_heatmap$col_side,
+        
+        margins = c(7, 12),
+        lwid = c(1.2, 9),
+        lhei = c(2, 8),
+        labRow = pull(anova_filtered, gene_name),
+        labCol = pull(sample_info_heatmap, lab_col),
+        srtCol = 90,
+        cexRow = 1.2,
+        cexCol = 1,
+        offsetRow = 0,
+        offsetCol = 0,
+    ) -> h
+    invisible(h)
+}
+```
+
+### treatment: Ctrl, IFNg, LPS
+```{r heatmap_anova_, echo=FALSE, fig.align="center", fig.height=6, fig.width=13, results='asis', include=TRUE, warning=FALSE}
+cnts <- data.matrix(srna[['counts']])
+rownames(cnts) <- srna[['annot']]$gene_id
+
+anova_filtered <- slice_min(anova_fdr, treatment, n = 10)
+  
+print_anova_table(anova_filtered)
+plot_anova_heatmap(anova_filtered, cnts)
+```
+
+### grupa: HF, OA
+```{r heatmap_anova_4, echo=FALSE, fig.align="center", fig.height=6, fig.width=13, results='asis', include=TRUE, warning=FALSE}
+anova_filtered <- slice_min(anova_fdr, treatment, n = 10)
+  
+print_anova_table(anova_filtered)
+plot_anova_heatmap(anova_filtered, cnts)
+```
+
+### interakcja
+```{r heatmap_anova_4x, echo=FALSE, fig.align="center", fig.height=6, fig.width=13, results='asis', include=TRUE, warning=FALSE}
+anova_filtered <- slice_min(anova_fdr, treatment, n = 10)
+  
+print_anova_table(anova_filtered)
+plot_anova_heatmap(anova_filtered, cnts)
+```
+
