@@ -1,0 +1,286 @@
+---
+title: "ifpan-chwastek-srna"
+output:
+  html_document:
+    toc: yes
+
+date: "_Ostatnio sporządzony: `r format(Sys.time(), '%d %B, %Y %H:%M:%S')`_"
+
+knit: (function(input, ...) {
+    rmarkdown::render(
+      input,
+      output_file = paste0(
+        xfun::sans_ext(input), '-tmp.html'
+      ),
+      envir = globalenv()
+    )
+  })
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(cache = TRUE, include = FALSE, warning = FALSE)
+```
+
+```{r install_packages, eval=FALSE}
+install.packages('gplots')
+install.packages('rstatix')
+install.packages('kableExtra')
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+# https://github.com/Bioconductor/bioconductor_docker/issues/22
+BiocManager::install("preprocessCore", configure.args="--disable-threading")
+```
+
+```{r}
+library(tidyverse)
+library(preprocessCore)
+library(gplots)
+library(RColorBrewer)
+library(rstatix)
+library(kableExtra)
+```
+
+```{r load_data}
+srna_counts <- 
+  read_tsv('data/feature-counts/srna-counts-mirbase.txt', comment = '#') %>% 
+  rename(mir_id = Geneid) %>% 
+  select(-c(Chr, Start, End, Strand, Length))
+  
+.disease_cols <- str_extract(colnames(srna_counts), '(HF|OA)\\d+')
+.is_sample <- !is.na(.disease_cols)
+colnames(srna_counts)[.is_sample] <- .disease_cols[.is_sample]
+
+
+feature_info <- read_tsv(
+  'data/hsa.gff3',
+  col_type = 'cccddcccc',
+  col_names = c(
+    'chr', 'source', 'feature', 'start', 'end',
+    'score', 'strand', 'frame', 'attribute'
+  ),
+  comment = "#"
+) 
+.mir_id <- str_split(feature_info$attribute, ';', simplify = TRUE)[, 1]
+.mir_id <- str_sub(.mir_id, 4)
+.mir_name <- str_split(feature_info$attribute, ';', simplify = TRUE)[, 3]
+.mir_name <- str_sub(.mir_name, 6)
+feature_info <- 
+  feature_info %>% 
+  mutate(mir_name = .mir_name, mir_id = .mir_id) %>% 
+  select(chr, feature, start, end, mir_id, mir_name)
+
+
+sample_info <- 
+  read_tsv(
+    "raw/2021-07-09-lista-próbek-sekwencjonowanie.csv",
+    col_names = c('id', 'patient_id', 'treatment')
+  ) %>% 
+  mutate(disease = str_sub(id, end = 2)) %>% 
+  mutate(comment = "ok")
+sample_info[sample_info$id == 'HF011', 'comment'] <- "low quality"
+sample_info[sample_info$id == 'OA222', 'comment'] <- "not performed"
+
+write_tsv(sample_info, 'data/sample-info.tsv')
+```
+Pozostawiono wiersze, które dla przynajmniej połowy próbek nie miały zerowych zliczeń lub maksymalne zliczenie było większe od 4 dla dowolnej probki.
+
+```{r filter_data}
+.median_in_row <- apply(select(srna_counts, -mir_id), 1, median)
+.max_in_row <- apply(select(srna_counts, -mir_id), 1, max)
+srna_counts_filtered <-
+  srna_counts %>% 
+  left_join(feature_info, by = 'mir_id') %>%
+  relocate(starts_with('HF'), starts_with('OA'), .after = last_col()) %>%
+  filter(.median_in_row > 0 | .max_in_row > 4)
+
+sample_info <- 
+  read_tsv('data/sample-info.tsv') %>% 
+  filter(comment == "ok") %>%
+  select(id, patient_id, treatment, disease)
+```
+
+```{r norm_log}
+srna <- list('counts' = NULL, 'normlog' = NULL, 'annot' = NULL)
+srna[['counts']] <- 
+  srna_counts_filtered %>% 
+  select(starts_with('HF'), starts_with('OA'))
+
+srna[['annot']] <- 
+  srna_counts_filtered %>% 
+  select(-starts_with('HF'), -starts_with('OA'))
+
+srna[['normlog']] <-
+  srna[['counts']] %>% 
+  data.matrix %>% 
+  normalize.quantiles(copy = FALSE) %>%
+  {log2(. + 1)}
+rownames(srna$normlog) <- srna$annot$mir_id
+```
+
+```{r save_norm_log}
+bind_cols(srna$annot, as_tibble(srna$normlog)) %>% 
+  write_tsv('data/srna-counts-mirbase-normalized-log2.tsv')
+```
+
+
+```{r}
+srna[['anova_template']] <-
+    tibble(id = colnames(srna$counts)) %>%
+    left_join(sample_info, by = 'id') %>%
+    mutate(counts = -1)
+
+compute_anova <- function(x, fpkm_df = srna$anova_template, progress_bar = NULL) {
+  if (!is.na(progress_bar)) {
+    setTxtProgressBar(progress_bar, i)
+    i <<- i + 1
+  }
+  
+  fpkm_df %>%
+  left_join(as_tibble(x, rownames = 'id'), by = 'id') %>%
+  mutate(counts = value, .keep = 'unused') %>%
+  anova_test(
+      dv = counts,
+      wid = patient_id,
+      between = disease,
+      within = treatment
+  ) %>%
+  get_anova_table() %>%
+  data.frame() %>%
+  select(Effect, p) %>%
+  pivot_wider(names_from = Effect, values_from = p)
+}
+```
+
+```{r anova_4x3, eval=F}
+i <- 1
+pb <- txtProgressBar(min = 0, max = dim(srna[['normlog']])[1], style = 3)
+anova <- apply(
+    srna[['normlog']],
+    1,
+    compute_anova,
+    fpkm_df = srna[['anova_template']],
+    progress_bar = pb
+)
+anova <- bind_rows(anova)
+anova[['mir_id']] <- rownames(srna[['normlog']])
+
+anova_fdr <- 
+  anova %>% 
+  mutate(across(-mir_id, list(fdr = p.adjust), method = 'fdr')) %>%
+  full_join(srna[['annot']], by = 'mir_id') %>%
+  relocate(contains('treatment'), contains('disease'), .after = last_col())
+
+saveRDS(anova_fdr, 'analysis/anova_fdr_mirbase.RDS')
+```
+- **<span style='color: #E41A1C'>pasek czerwony</span>**: Ctrl
+- **<span style='color: #377EB8'>pasek niebieski</span>**: LPS
+- **<span style='color: #4DAF4A'>pasek zielony</span>**: IFNg
+
+```{r heatmap_preparation}
+anova_fdr <- readRDS('analysis/anova_fdr_mirbase.RDS')
+
+print_anova_table <- function(anova_filtered) {
+    anova_filtered %>% 
+        kbl(digits = 3, caption = '') %>% 
+        kable_styling(bootstrap_options = c("bordered", "hover", "condensed")) %>% 
+        print
+}
+
+plot_anova_heatmap <- function(anova_filtered, data, row_v = TRUE) {
+    palette <- brewer.pal(11, "RdBu")
+    rdbu_ramp <- colorRampPalette(palette)
+    
+    treatments <- c('Ctrl', 'LPS', 'IFNg')
+    y_join_colors <- tibble(
+        treatment = treatments,
+        col_side = brewer.pal(length(treatments), 'Set1')
+    )
+    sample_info_heatmap <- 
+        sample_info %>% 
+        left_join(y_join_colors, by = 'treatment') %>%
+        mutate(lab_col = paste(id, disease, sep = ' · ')) %>% 
+        arrange(treatment, disease)
+    
+    genes_oi <- pull(anova_filtered, gene_id)
+    diseases_arranged <- pull(sample_info_heatmap, id)
+    
+    col_sep <- sample_info_heatmap %>% 
+        group_by(treatment) %>% 
+        mutate(sep = !duplicated(disease)) %>% 
+        pull(sep) %>% 
+        which
+    col_sep <- col_sep[-1] - 1
+    
+    heatmap.2(
+        x = data[genes_oi, diseases_arranged],
+        Rowv = row_v,
+        Colv = FALSE,
+        dendrogram = 'row',
+        distfun = function(x) as.dist(1-cor(t(x))),
+        
+        scale = "row",
+        breaks = seq(-3, 3, 0.25),
+        col = rev(rdbu_ramp(24)),
+        
+        colsep = col_sep,
+        sepcolor = 'white',
+        sepwidth = c(0.2, 0.2),
+        trace = "none",
+        
+        ColSideColors = sample_info_heatmap$col_side,
+        
+        margins = c(7, 12),
+        lwid = c(1.2, 9),
+        lhei = c(2, 8),
+        labRow = pull(anova_filtered, mir_name),
+        labCol = pull(sample_info_heatmap, lab_col),
+        srtCol = 90,
+        cexRow = 1.6,
+        cexCol = 1,
+        offsetRow = 0,
+        offsetCol = 0,
+    ) -> h
+    invisible(h)
+}
+```
+
+### treatment: Ctrl, IFNg, LPS
+```{r heatmap_anova_, echo=FALSE, fig.align="center", fig.height=6, fig.width=13, results='asis', include=TRUE, warning=FALSE, cache=FALSE}
+cnts <- data.matrix(srna[['counts']])
+rownames(cnts) <- srna[['annot']]$mir_id
+
+anova_filtered <-
+  slice_min(anova_fdr, treatment, n = 10) %>% 
+  rename(gene_id = mir_id)
+  
+print_anova_table(anova_filtered)
+plot_anova_heatmap(anova_filtered, cnts)
+```
+
+### grupa: HF, OA
+```{r heatmap_anova_4, echo=FALSE, fig.align="center", fig.height=6, fig.width=13, results='asis', include=TRUE, warning=FALSE, cache=FALSE}
+anova_filtered <-
+  slice_min(anova_fdr, disease, n = 10) %>%
+  rename(gene_id = mir_id)
+  
+print_anova_table(anova_filtered)
+plot_anova_heatmap(anova_filtered, cnts)
+```
+
+### interakcja
+```{r heatmap_anova_4x, echo=FALSE, fig.align="center", fig.height=6, fig.width=13, results='asis', include=TRUE, warning=FALSE, cache=FALSE}
+anova_filtered <-
+  slice_min(anova_fdr, `disease:treatment`, n = 10) %>%
+  rename(gene_id = mir_id)
+  
+print_anova_table(anova_filtered)
+plot_anova_heatmap(anova_filtered, cnts)
+```
+
+```{bash copy_results, eval = FALSE}
+cp data/srna-counts-mirbase-normalized-log2.tsv results/
+cp data/sample-info.tsv results/
+```
