@@ -45,31 +45,32 @@ library(kableExtra)
 
 ```{r load_data}
 srna_counts <- 
-  read_tsv('data/feature-counts/srna-counts-dashr.txt', comment = '#') %>% 
-  rename(gene_id = Geneid) %>% 
+  read_tsv('data/feature-counts/srna-counts-mirbase.txt', comment = '#') %>% 
+  rename(mir_id = Geneid) %>% 
   select(-c(Chr, Start, End, Strand, Length))
   
-.group_cols <- str_extract(colnames(srna_counts), '(HF|OA)\\d+')
-.is_sample <- !is.na(.group_cols)
-colnames(srna_counts)[.is_sample] <- .group_cols[.is_sample]
+.disease_cols <- str_extract(colnames(srna_counts), '(HF|OA)\\d+')
+.is_sample <- !is.na(.disease_cols)
+colnames(srna_counts)[.is_sample] <- .disease_cols[.is_sample]
 
-gene_info <- read_tsv(
-  'data/dashr.v2.sncRNA.annotation.hg38.gff',
+
+feature_info <- read_tsv(
+  'data/hsa.gff3',
   col_type = 'cccddcccc',
   col_names = c(
     'chr', 'source', 'feature', 'start', 'end',
     'score', 'strand', 'frame', 'attribute'
-  )
+  ),
+  comment = "#"
 ) 
-gene_info <- filter(gene_info, str_detect(attribute, 'ID'))
-.gene_id <- str_split(gene_info$attribute, ';', simplify = TRUE)[, 1]
-.gene_id <- str_sub(.gene_id, 4)
-gene_info <- 
-  gene_info %>% 
-  mutate(gene_id = .gene_id) %>% 
-  select(feature, gene_id) %>% 
-  arrange(feature) %>% 
-  distinct(gene_id, .keep_all = TRUE)
+.mir_id <- str_split(feature_info$attribute, ';', simplify = TRUE)[, 1]
+.mir_id <- str_sub(.mir_id, 4)
+.mir_name <- str_split(feature_info$attribute, ';', simplify = TRUE)[, 3]
+.mir_name <- str_sub(.mir_name, 6)
+feature_info <- 
+  feature_info %>% 
+  mutate(mir_name = .mir_name, mir_id = .mir_id) %>% 
+  select(chr, feature, start, end, mir_id, mir_name)
 
 
 sample_info <- 
@@ -77,27 +78,28 @@ sample_info <-
     "raw/2021-07-09-lista-próbek-sekwencjonowanie.csv",
     col_names = c('id', 'patient_id', 'treatment')
   ) %>% 
-  mutate(group = str_sub(id, end = 2)) %>% 
+  mutate(disease = str_sub(id, end = 2)) %>% 
   mutate(comment = "ok")
 sample_info[sample_info$id == 'HF011', 'comment'] <- "low quality"
 sample_info[sample_info$id == 'OA222', 'comment'] <- "not performed"
 
-write_tsv(sample_info, 'data/sample_info.tsv')
+write_tsv(sample_info, 'data/sample-info.tsv')
 ```
+Pozostawiono wiersze, które dla przynajmniej połowy próbek nie miały zerowych zliczeń lub maksymalne zliczenie było większe od 4 dla dowolnej probki.
 
 ```{r filter_data}
-.median_in_row <- apply(select(srna_counts, -gene_id), 1, median)
+.median_in_row <- apply(select(srna_counts, -mir_id), 1, median)
+.max_in_row <- apply(select(srna_counts, -mir_id), 1, max)
 srna_counts_filtered <-
   srna_counts %>% 
-  left_join(gene_info, by = 'gene_id') %>%
-  relocate(gene_id, feature) %>%
-  filter(.median_in_row > 0) %>% 
-  filter(feature != 'lnc_RNA')
+  left_join(feature_info, by = 'mir_id') %>%
+  relocate(starts_with('HF'), starts_with('OA'), .after = last_col()) %>%
+  filter(.median_in_row > 0 | .max_in_row > 4)
 
 sample_info <- 
-  read_tsv('data/sample_info.tsv') %>% 
+  read_tsv('data/sample-info.tsv') %>% 
   filter(comment == "ok") %>%
-  select(id, patient_id, treatment, group)
+  select(id, patient_id, treatment, disease)
 ```
 
 ```{r norm_log}
@@ -115,12 +117,12 @@ srna[['normlog']] <-
   data.matrix %>% 
   normalize.quantiles(copy = FALSE) %>%
   {log2(. + 1)}
-rownames(srna$normlog) <- srna$annot$gene_id
+rownames(srna$normlog) <- srna$annot$mir_id
 ```
 
-```{r save_norm_log, eval=F}
+```{r save_norm_log}
 bind_cols(srna$annot, as_tibble(srna$normlog)) %>% 
-  write_tsv('data/srna-counts-dashr-normalized-log2.tsv')
+  write_tsv('data/srna-counts-mirbase-normalized-log2.tsv')
 ```
 
 
@@ -142,7 +144,7 @@ compute_anova <- function(x, fpkm_df = srna$anova_template, progress_bar = NULL)
   anova_test(
       dv = counts,
       wid = patient_id,
-      between = group,
+      between = disease,
       within = treatment
   ) %>%
   get_anova_table() %>%
@@ -163,19 +165,22 @@ anova <- apply(
     progress_bar = pb
 )
 anova <- bind_rows(anova)
-anova[['gene_id']] <- rownames(srna[['normlog']])
+anova[['mir_id']] <- rownames(srna[['normlog']])
 
 anova_fdr <- 
   anova %>% 
-  mutate(across(-gene_id, list(fdr = p.adjust), method = 'fdr')) %>%
-  full_join(srna[['annot']], by = 'gene_id') %>%
-  relocate(gene_id, feature)
+  mutate(across(-mir_id, list(fdr = p.adjust), method = 'fdr')) %>%
+  full_join(srna[['annot']], by = 'mir_id') %>%
+  relocate(contains('treatment'), contains('disease'), .after = last_col())
 
-saveRDS(anova_fdr, 'analysis/anova_fdr_dashr.RDS')
+saveRDS(anova_fdr, 'analysis/anova_fdr_mirbase.RDS')
 ```
+- **<span style='color: #E41A1C'>pasek czerwony</span>**: Ctrl
+- **<span style='color: #377EB8'>pasek niebieski</span>**: LPS
+- **<span style='color: #4DAF4A'>pasek zielony</span>**: IFNg
 
 ```{r heatmap_preparation}
-anova_fdr <- readRDS('analysis/anova_fdr_dashr.RDS')
+anova_fdr <- readRDS('analysis/anova_fdr_mirbase.RDS')
 
 print_anova_table <- function(anova_filtered) {
     anova_filtered %>% 
@@ -196,21 +201,21 @@ plot_anova_heatmap <- function(anova_filtered, data, row_v = TRUE) {
     sample_info_heatmap <- 
         sample_info %>% 
         left_join(y_join_colors, by = 'treatment') %>%
-        mutate(lab_col = paste(id, group, sep = ' · ')) %>% 
-        arrange(treatment, group)
+        mutate(lab_col = paste(id, disease, sep = ' · ')) %>% 
+        arrange(treatment, disease)
     
     genes_oi <- pull(anova_filtered, gene_id)
-    groups_arranged <- pull(sample_info_heatmap, id)
+    diseases_arranged <- pull(sample_info_heatmap, id)
     
     col_sep <- sample_info_heatmap %>% 
         group_by(treatment) %>% 
-        mutate(sep = !duplicated(group)) %>% 
+        mutate(sep = !duplicated(disease)) %>% 
         pull(sep) %>% 
         which
     col_sep <- col_sep[-1] - 1
     
     heatmap.2(
-        x = data[genes_oi, groups_arranged],
+        x = data[genes_oi, diseases_arranged],
         Rowv = row_v,
         Colv = FALSE,
         dendrogram = 'row',
@@ -230,7 +235,7 @@ plot_anova_heatmap <- function(anova_filtered, data, row_v = TRUE) {
         margins = c(7, 12),
         lwid = c(1.2, 9),
         lhei = c(2, 8),
-        labRow = pull(anova_filtered, gene_id),
+        labRow = pull(anova_filtered, mir_name),
         labCol = pull(sample_info_heatmap, lab_col),
         srtCol = 90,
         cexRow = 1.6,
@@ -245,10 +250,11 @@ plot_anova_heatmap <- function(anova_filtered, data, row_v = TRUE) {
 ### treatment: Ctrl, IFNg, LPS
 ```{r heatmap_anova_, echo=FALSE, fig.align="center", fig.height=6, fig.width=13, results='asis', include=TRUE, warning=FALSE, cache=FALSE}
 cnts <- data.matrix(srna[['counts']])
-rownames(cnts) <- srna[['annot']]$gene_id
+rownames(cnts) <- srna[['annot']]$mir_id
 
 anova_filtered <-
-  slice_min(anova_fdr, treatment, n = 10)
+  slice_min(anova_fdr, treatment, n = 10) %>% 
+  rename(gene_id = mir_id)
   
 print_anova_table(anova_filtered)
 plot_anova_heatmap(anova_filtered, cnts)
@@ -257,7 +263,8 @@ plot_anova_heatmap(anova_filtered, cnts)
 ### grupa: HF, OA
 ```{r heatmap_anova_4, echo=FALSE, fig.align="center", fig.height=6, fig.width=13, results='asis', include=TRUE, warning=FALSE, cache=FALSE}
 anova_filtered <-
-  slice_min(anova_fdr, group, n = 10)
+  slice_min(anova_fdr, disease, n = 10) %>%
+  rename(gene_id = mir_id)
   
 print_anova_table(anova_filtered)
 plot_anova_heatmap(anova_filtered, cnts)
@@ -266,9 +273,14 @@ plot_anova_heatmap(anova_filtered, cnts)
 ### interakcja
 ```{r heatmap_anova_4x, echo=FALSE, fig.align="center", fig.height=6, fig.width=13, results='asis', include=TRUE, warning=FALSE, cache=FALSE}
 anova_filtered <-
-  slice_min(anova_fdr, `group:treatment`, n = 10)
+  slice_min(anova_fdr, `disease:treatment`, n = 10) %>%
+  rename(gene_id = mir_id)
   
 print_anova_table(anova_filtered)
 plot_anova_heatmap(anova_filtered, cnts)
 ```
 
+```{bash copy_results, eval = FALSE}
+cp data/srna-counts-mirbase-normalized-log2.tsv results/
+cp data/sample-info.tsv results/
+```
