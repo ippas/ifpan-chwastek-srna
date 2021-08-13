@@ -45,7 +45,7 @@ library(kableExtra)
 
 ```{r load_data}
 srna_counts <- 
-  read_tsv('data/feature-counts/srna-counts.txt', comment = '#') %>% 
+  read_tsv('data/feature-counts/srna-counts-dashr.txt', comment = '#') %>% 
   rename(gene_id = Geneid) %>% 
   select(-c(Chr, Start, End, Strand, Length))
   
@@ -53,11 +53,24 @@ srna_counts <-
 .is_sample <- !is.na(.group_cols)
 colnames(srna_counts)[.is_sample] <- .group_cols[.is_sample]
 
-names <- read_tsv(
-  'data/gtf_annotations.tsv',
-  col_types = 'cccc-',
-  col_names = c('gene_id', 'gene_name', 'source', 'description')
-)
+gene_info <- read_tsv(
+  'data/dashr.v2.sncRNA.annotation.hg38.gff',
+  col_type = 'cccddcccc',
+  col_names = c(
+    'chr', 'source', 'feature', 'start', 'end',
+    'score', 'strand', 'frame', 'attribute'
+  )
+) 
+gene_info <- filter(gene_info, str_detect(attribute, 'ID'))
+.gene_id <- str_split(gene_info$attribute, ';', simplify = TRUE)[, 1]
+.gene_id <- str_sub(.gene_id, 4)
+gene_info <- 
+  gene_info %>% 
+  mutate(gene_id = .gene_id) %>% 
+  select(feature, gene_id) %>% 
+  arrange(feature) %>% 
+  distinct(gene_id, .keep_all = TRUE)
+
 
 sample_info <- 
   read_tsv(
@@ -74,17 +87,20 @@ write_tsv(sample_info, 'data/sample_info.tsv')
 
 ```{r filter_data}
 .median_in_row <- apply(select(srna_counts, -gene_id), 1, median)
-.small <- c(
-  "miRNA", "snRNA", "snoRNA", "rRNA", "scRNA",
-  "sRNA", "vaultRNA", "Mt_tRNA", "Mt_rRNA"
-)
 srna_counts_filtered <-
   srna_counts %>% 
-  left_join(names, by = 'gene_id') %>% 
-  relocate(gene_id, gene_name, source, description) %>% 
-  filter(.median_in_row > 0) %>%
-  filter(description %in% .small)
+  left_join(gene_info, by = 'gene_id') %>%
+  relocate(gene_id, feature) %>%
+  filter(.median_in_row > 0) %>% 
+  filter(feature != 'lnc_RNA')
 
+sample_info <- 
+  read_tsv('data/sample_info.tsv') %>% 
+  filter(comment == "ok") %>%
+  select(id, patient_id, treatment, group)
+```
+
+```{r norm_log}
 srna <- list('counts' = NULL, 'normlog' = NULL, 'annot' = NULL)
 srna[['counts']] <- 
   srna_counts_filtered %>% 
@@ -100,12 +116,13 @@ srna[['normlog']] <-
   normalize.quantiles(copy = FALSE) %>%
   {log2(. + 1)}
 rownames(srna$normlog) <- srna$annot$gene_id
-
-sample_info <- 
-  read_tsv('data/sample_info.tsv') %>% 
-  filter(comment == "ok") %>%
-  select(id, patient_id, treatment, group)
 ```
+
+```{r save_norm_log, eval=F}
+bind_cols(srna$annot, as_tibble(srna$normlog)) %>% 
+  write_tsv('data/srna-counts-dashr-normalized-log2.tsv')
+```
+
 
 ```{r}
 srna[['anova_template']] <-
@@ -113,30 +130,37 @@ srna[['anova_template']] <-
     left_join(sample_info, by = 'id') %>%
     mutate(counts = -1)
 
-compute_anova <- function(x, fpkm_df = srna$anova_template, dismiss_pma = FALSE) {
-    fpkm_df %>%
-    left_join(as_tibble(x, rownames = 'id'), by = 'id') %>%
-    mutate(counts = value, .keep = 'unused') %>%
-    {if (dismiss_pma) filter(., stimulation != 'PMA') else .} %>%
-    anova_test(
-        dv = counts,
-        wid = patient_id,
-        between = group,
-        within = treatment
-    ) %>%
-    get_anova_table() %>%
-    data.frame() %>%
-    select(Effect, p) %>%
-    pivot_wider(names_from = Effect, values_from = p)
+compute_anova <- function(x, fpkm_df = srna$anova_template, progress_bar = NULL) {
+  if (!is.na(progress_bar)) {
+    setTxtProgressBar(progress_bar, i)
+    i <<- i + 1
+  }
+  
+  fpkm_df %>%
+  left_join(as_tibble(x, rownames = 'id'), by = 'id') %>%
+  mutate(counts = value, .keep = 'unused') %>%
+  anova_test(
+      dv = counts,
+      wid = patient_id,
+      between = group,
+      within = treatment
+  ) %>%
+  get_anova_table() %>%
+  data.frame() %>%
+  select(Effect, p) %>%
+  pivot_wider(names_from = Effect, values_from = p)
 }
 ```
 
 ```{r anova_4x3, eval=F}
+i <- 1
+pb <- txtProgressBar(min = 0, max = dim(srna[['normlog']])[1], style = 3)
 anova <- apply(
     srna[['normlog']],
     1,
     compute_anova,
-    fpkm_df = srna[['anova_template']]
+    fpkm_df = srna[['anova_template']],
+    progress_bar = pb
 )
 anova <- bind_rows(anova)
 anova[['gene_id']] <- rownames(srna[['normlog']])
@@ -144,14 +168,14 @@ anova[['gene_id']] <- rownames(srna[['normlog']])
 anova_fdr <- 
   anova %>% 
   mutate(across(-gene_id, list(fdr = p.adjust), method = 'fdr')) %>%
-  full_join(srna[['annot']] %>% select(gene_id, gene_name, description), by = 'gene_id') %>%
-  relocate(gene_id, gene_name, description)
+  full_join(srna[['annot']], by = 'gene_id') %>%
+  relocate(gene_id, feature)
 
-saveRDS(anova_fdr, 'analysis/anova_fdr.RDS')
+saveRDS(anova_fdr, 'analysis/anova_fdr_dashr.RDS')
 ```
 
 ```{r heatmap_preparation}
-anova_fdr <- readRDS('analysis/anova_fdr.RDS')
+anova_fdr <- readRDS('analysis/anova_fdr_dashr.RDS')
 
 print_anova_table <- function(anova_filtered) {
     anova_filtered %>% 
@@ -206,10 +230,10 @@ plot_anova_heatmap <- function(anova_filtered, data, row_v = TRUE) {
         margins = c(7, 12),
         lwid = c(1.2, 9),
         lhei = c(2, 8),
-        labRow = pull(anova_filtered, gene_name),
+        labRow = pull(anova_filtered, gene_id),
         labCol = pull(sample_info_heatmap, lab_col),
         srtCol = 90,
-        cexRow = 1.2,
+        cexRow = 1.6,
         cexCol = 1,
         offsetRow = 0,
         offsetCol = 0,
@@ -219,27 +243,30 @@ plot_anova_heatmap <- function(anova_filtered, data, row_v = TRUE) {
 ```
 
 ### treatment: Ctrl, IFNg, LPS
-```{r heatmap_anova_, echo=FALSE, fig.align="center", fig.height=6, fig.width=13, results='asis', include=TRUE, warning=FALSE}
+```{r heatmap_anova_, echo=FALSE, fig.align="center", fig.height=6, fig.width=13, results='asis', include=TRUE, warning=FALSE, cache=FALSE}
 cnts <- data.matrix(srna[['counts']])
 rownames(cnts) <- srna[['annot']]$gene_id
 
-anova_filtered <- slice_min(anova_fdr, treatment, n = 10)
+anova_filtered <-
+  slice_min(anova_fdr, treatment, n = 10)
   
 print_anova_table(anova_filtered)
 plot_anova_heatmap(anova_filtered, cnts)
 ```
 
 ### grupa: HF, OA
-```{r heatmap_anova_4, echo=FALSE, fig.align="center", fig.height=6, fig.width=13, results='asis', include=TRUE, warning=FALSE}
-anova_filtered <- slice_min(anova_fdr, treatment, n = 10)
+```{r heatmap_anova_4, echo=FALSE, fig.align="center", fig.height=6, fig.width=13, results='asis', include=TRUE, warning=FALSE, cache=FALSE}
+anova_filtered <-
+  slice_min(anova_fdr, group, n = 10)
   
 print_anova_table(anova_filtered)
 plot_anova_heatmap(anova_filtered, cnts)
 ```
 
 ### interakcja
-```{r heatmap_anova_4x, echo=FALSE, fig.align="center", fig.height=6, fig.width=13, results='asis', include=TRUE, warning=FALSE}
-anova_filtered <- slice_min(anova_fdr, treatment, n = 10)
+```{r heatmap_anova_4x, echo=FALSE, fig.align="center", fig.height=6, fig.width=13, results='asis', include=TRUE, warning=FALSE, cache=FALSE}
+anova_filtered <-
+  slice_min(anova_fdr, `group:treatment`, n = 10)
   
 print_anova_table(anova_filtered)
 plot_anova_heatmap(anova_filtered, cnts)
