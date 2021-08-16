@@ -174,7 +174,9 @@ anova_fdr <-
   relocate(contains('treatment'), contains('disease'), .after = last_col())
 
 saveRDS(anova_fdr, 'analysis/anova_fdr_mirbase.RDS')
+write_tsv(anova_fdr, 'data/srna-counts-mirbase-anova.tsv')
 ```
+
 - **<span style='color: #E41A1C'>pasek czerwony</span>**: Ctrl
 - **<span style='color: #377EB8'>pasek niebieski</span>**: LPS
 - **<span style='color: #4DAF4A'>pasek zielony</span>**: IFNg
@@ -283,4 +285,8 @@ plot_anova_heatmap(anova_filtered, cnts)
 ```{bash copy_results, eval = FALSE}
 cp data/srna-counts-mirbase-normalized-log2.tsv results/
 cp data/sample-info.tsv results/
+```
+
+```{bash copy_results_2, eval = FALSE}
+cp data/srna-counts-mirbase-anova.tsv results/
 ```
