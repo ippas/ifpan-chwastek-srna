@@ -60,7 +60,7 @@
     "OA772",
     "OA773"
   ],
-  "rna_seq_small.input_organism_name": "Homo sapiens",
+  "rna_seq_small.organism_name": "Homo sapiens",
   "rna_seq_small.release_version": "100",
   "rna_seq_small.fq_organize.number_of_reads_per_file": 100000000
 }
